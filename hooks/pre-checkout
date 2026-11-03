@@ -2,7 +2,78 @@
 
 set -euo pipefail
 
-DEPTH="${BUILDKITE_PLUGIN_SHALLOW_CLONE_DEPTH:-1}"
+BYPASS_MIRRORS="${BUILDKITE_PLUGIN_SHALLOW_CLONE_BYPASS_MIRRORS:-false}"
+DEPTH="${BUILDKITE_PLUGIN_SHALLOW_CLONE_DEPTH:-}"
 
-export BUILDKITE_GIT_CLONE_FLAGS="-v --depth ${DEPTH}"
-export BUILDKITE_GIT_FETCH_FLAGS="-v --prune --depth ${DEPTH}"
+if [[ "${BYPASS_MIRRORS}" == "true" ]]; then
+  # Skip the agent's default mirrored checkout
+  export BUILDKITE_SKIP_CHECKOUT=true
+  
+  echo "--- :git: Bypassing agent git mirrors with blobless clone"
+  
+  # Determine target directory (agent's normal checkout path)
+  CHECKOUT_DIR="${BUILDKITE_BUILD_CHECKOUT_PATH:-${PWD}}"
+  
+  # Clean up any existing checkout to ensure fresh clone
+  if [[ -d "${CHECKOUT_DIR}/.git" ]]; then
+    echo "Removing existing git directory at ${CHECKOUT_DIR}"
+    rm -rf "${CHECKOUT_DIR}"
+  fi
+  
+  # Create parent directory if needed
+  mkdir -p "$(dirname "${CHECKOUT_DIR}")"
+  
+  # Prepare clone flags
+  CLONE_FLAGS="-v --filter=blob:none"
+  
+  # Add depth if specified and compatible
+  if [[ -n "${DEPTH}" ]]; then
+    CLONE_FLAGS="${CLONE_FLAGS} --depth ${DEPTH}"
+  fi
+  
+  # Clone the repository with blobless filter
+  echo "Cloning ${BUILDKITE_REPO} to ${CHECKOUT_DIR}"
+  git clone ${CLONE_FLAGS} --no-checkout "${BUILDKITE_REPO}" "${CHECKOUT_DIR}"
+  
+  cd "${CHECKOUT_DIR}"
+  
+  # Fetch the specific ref we need to build (handles branches, PRs, tags)
+  if [[ -n "${BUILDKITE_BRANCH:-}" && "${BUILDKITE_BRANCH}" =~ ^refs/ ]]; then
+    # Full ref path (e.g., refs/pull/123/head)
+    echo "Fetching ref ${BUILDKITE_BRANCH}"
+    git fetch -v origin "${BUILDKITE_BRANCH}"
+  else
+    # Regular branch or tag, fetch the commit directly
+    echo "Fetching commit ${BUILDKITE_COMMIT}"
+    git fetch -v origin "${BUILDKITE_COMMIT}"
+  fi
+  
+  # Checkout the commit
+  echo "Checking out ${BUILDKITE_COMMIT}"
+  git checkout -f "${BUILDKITE_COMMIT}"
+  
+  # Ensure default branch ref exists for if_changed merge-base
+  DEFAULT_BRANCH="${BUILDKITE_PIPELINE_DEFAULT_BRANCH:-main}"
+  echo "Ensuring ${DEFAULT_BRANCH} ref exists for if_changed support"
+  
+  # Fetch default branch for merge-base calculations
+  if [[ -n "${DEPTH}" ]]; then
+    # With depth, fetch shallow default branch
+    git fetch -v --depth "${DEPTH}" origin "${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}" || true
+  else
+    # Without depth, fetch full default branch
+    git fetch -v origin "${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}" || true
+  fi
+  
+  # Set BUILDKITE_FETCH_DIFF_BASE for additional safety with shallow clones
+  export BUILDKITE_FETCH_DIFF_BASE=true
+  
+  echo "Blobless checkout complete at $(git rev-parse HEAD)"
+  
+else
+  # Original behavior: set flags for agent's built-in checkout
+  if [[ -n "${DEPTH}" ]]; then
+    export BUILDKITE_GIT_CLONE_FLAGS="-v --depth ${DEPTH}"
+    export BUILDKITE_GIT_FETCH_FLAGS="-v --prune --depth ${DEPTH}"
+  fi
+fi
