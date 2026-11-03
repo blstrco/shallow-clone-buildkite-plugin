@@ -3,19 +3,35 @@
 set -euo pipefail
 
 BYPASS_MIRRORS="${BUILDKITE_PLUGIN_SHALLOW_CLONE_BYPASS_MIRRORS:-false}"
-DEPTH="${BUILDKITE_PLUGIN_SHALLOW_CLONE_DEPTH:-}"
 
 if [[ "${BYPASS_MIRRORS}" == "true" ]]; then
   # Skip the agent's default mirrored checkout
   export BUILDKITE_SKIP_CHECKOUT=true
   
-  echo "--- :git: Bypassing agent git mirrors with blobless clone"
+  echo "--- :git: Bypassing agent git mirrors with blobless + sparse clone"
+  
+  # Optional depth for bypass mode (full history if unset)
+  DEPTH="${BUILDKITE_PLUGIN_SHALLOW_CLONE_DEPTH:-}"
+  
+  # Sparse paths (default to .buildkite for upload steps)
+  # Read array from plugin config or default
+  SPARSE_PATHS=()
+  while IFS= read -r path; do
+    [[ -n "$path" ]] && SPARSE_PATHS+=("$path")
+  done < <(env | grep '^BUILDKITE_PLUGIN_SHALLOW_CLONE_SPARSE_PATHS_[0-9]\+=' | sort -V | cut -d= -f2-)
+  
+  # Default to .buildkite if no sparse paths specified
+  if [[ ${#SPARSE_PATHS[@]} -eq 0 ]]; then
+    SPARSE_PATHS=(".buildkite")
+  fi
   
   # Determine target directory (agent's normal checkout path)
   CHECKOUT_DIR="${BUILDKITE_BUILD_CHECKOUT_PATH:-${PWD}}"
   
   # Clean up any existing checkout to ensure fresh clone
   if [[ -d "${CHECKOUT_DIR}/.git" ]]; then
+    # cd out of the directory before removing it
+    cd /
     echo "Removing existing git directory at ${CHECKOUT_DIR}"
     rm -rf "${CHECKOUT_DIR}"
   fi
@@ -26,16 +42,21 @@ if [[ "${BYPASS_MIRRORS}" == "true" ]]; then
   # Prepare clone flags
   CLONE_FLAGS="-v --filter=blob:none"
   
-  # Add depth if specified and compatible
+  # Add depth if specified
   if [[ -n "${DEPTH}" ]]; then
     CLONE_FLAGS="${CLONE_FLAGS} --depth ${DEPTH}"
   fi
   
-  # Clone the repository with blobless filter
+  # Clone the repository with blobless filter, no checkout yet
   echo "Cloning ${BUILDKITE_REPO} to ${CHECKOUT_DIR}"
   git clone ${CLONE_FLAGS} --no-checkout "${BUILDKITE_REPO}" "${CHECKOUT_DIR}"
   
   cd "${CHECKOUT_DIR}"
+  
+  # Configure sparse-checkout before materializing working tree
+  echo "Configuring sparse-checkout for: ${SPARSE_PATHS[*]}"
+  git sparse-checkout init --cone
+  git sparse-checkout set "${SPARSE_PATHS[@]}"
   
   # Fetch the specific ref we need to build (handles branches, PRs, tags)
   if [[ -n "${BUILDKITE_BRANCH:-}" && "${BUILDKITE_BRANCH}" =~ ^refs/ ]]; then
@@ -48,8 +69,8 @@ if [[ "${BYPASS_MIRRORS}" == "true" ]]; then
     git fetch -v origin "${BUILDKITE_COMMIT}"
   fi
   
-  # Checkout the commit
-  echo "Checking out ${BUILDKITE_COMMIT}"
+  # Checkout the commit (sparse-checkout limits what gets materialized)
+  echo "Checking out ${BUILDKITE_COMMIT} (sparse: ${SPARSE_PATHS[*]})"
   git checkout -f "${BUILDKITE_COMMIT}"
   
   # Ensure default branch ref exists for if_changed merge-base
@@ -57,23 +78,25 @@ if [[ "${BYPASS_MIRRORS}" == "true" ]]; then
   echo "Ensuring ${DEFAULT_BRANCH} ref exists for if_changed support"
   
   # Fetch default branch for merge-base calculations
+  # Fail loudly if this fails - it breaks if_changed
   if [[ -n "${DEPTH}" ]]; then
     # With depth, fetch shallow default branch
-    git fetch -v --depth "${DEPTH}" origin "${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}" || true
+    git fetch -v --depth "${DEPTH}" origin "${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
   else
     # Without depth, fetch full default branch
-    git fetch -v origin "${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}" || true
+    git fetch -v origin "${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
   fi
   
   # Set BUILDKITE_FETCH_DIFF_BASE for additional safety with shallow clones
   export BUILDKITE_FETCH_DIFF_BASE=true
   
-  echo "Blobless checkout complete at $(git rev-parse HEAD)"
+  echo "Blobless sparse checkout complete at $(git rev-parse HEAD)"
   
 else
   # Original behavior: set flags for agent's built-in checkout
-  if [[ -n "${DEPTH}" ]]; then
-    export BUILDKITE_GIT_CLONE_FLAGS="-v --depth ${DEPTH}"
-    export BUILDKITE_GIT_FETCH_FLAGS="-v --prune --depth ${DEPTH}"
-  fi
+  # Restore default depth=1 for backward compatibility
+  DEPTH="${BUILDKITE_PLUGIN_SHALLOW_CLONE_DEPTH:-1}"
+  
+  export BUILDKITE_GIT_CLONE_FLAGS="-v --depth ${DEPTH}"
+  export BUILDKITE_GIT_FETCH_FLAGS="-v --prune --depth ${DEPTH}"
 fi
