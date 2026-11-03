@@ -5,4 +5,8 @@ configuration:
   properties:
     depth:
       type: number
+    bypass-mirrors:
+      type: boolean
+    sparse-paths:
+      type: array
   additionalProperties: false
